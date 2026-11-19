@@ -11,10 +11,16 @@ Run it in Azure Cloud Shell (Bash or PowerShell):
 
     python3 nc2-azure-precheck.py
 
-Everything is read-only, EXCEPT the optional in-VNet connectivity test, which
-creates a temporary resource group with one small Ubuntu VM per tested subnet
-(no public IP), runs the outbound tests from inside your VNets, and deletes
-the resource group again.
+DISCLAIMER
+  * This is a community tool. It is NOT an official Nutanix product and is
+    NOT supported by Nutanix Support. The Nutanix documentation remains the
+    source of truth. Provided as-is, without warranty.
+  * Read-only by default: all checks only READ your Azure configuration and
+    change nothing. The ONLY exception is the optional in-VNet connectivity
+    test (off unless you answer "y" or pass --connectivity). It creates a
+    temporary resource group with one small Ubuntu VM per tested subnet (no
+    public IP), runs the outbound tests from inside your VNets, and deletes
+    that resource group again.
 
 Source requirements: Nutanix "Requirements for NC2 on Azure" (last updated
 2026-11-11) plus the related pages on resource providers, the NC2 custom role
@@ -38,10 +44,20 @@ import subprocess
 import sys
 import tempfile
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DOC_URL = ("https://portal.nutanix.com/page/documents/details?targetId="
            "Nutanix-Cloud-Clusters-Azure:nc2-clusters-azure-requirements-for-nc2-on-azure-c.html")
 DOC_DATE = "2026-11-11"
+REPO_URL = "https://github.com/hagoortn/nc2-azure-precheck"
+# Optional logos for the HTML report. Add the official files to the repo's
+# assets/ folder; until then the report shows text labels instead.
+LOGO_NC2_URL = "https://raw.githubusercontent.com/hagoortn/nc2-azure-precheck/main/assets/nutanix-nc2-logo.svg"
+LOGO_AZURE_URL = "https://raw.githubusercontent.com/hagoortn/nc2-azure-precheck/main/assets/azure-logo.svg"
+DISCLAIMER_LINES = [
+    "Community tool - NOT an official Nutanix product and NOT supported by Nutanix Support.",
+    "Read-only: checks only read your Azure configuration and change nothing.",
+    "Exception: the optional connectivity test (opt-in) creates temporary test VMs and deletes them afterwards.",
+]
 DELEGATION = "Microsoft.BareMetal/AzureHostedService"
 CVM_INTERNAL_NET = ipaddress.ip_network("192.168.5.0/24")
 
@@ -60,6 +76,13 @@ FGW_SKUS = {
 BGP_PRIMARY = ("Standard_D8s_v5", "standardDSv5Family", 8)
 BGP_FALLBACK = ("Standard_D3_v2", "standardDv2Family", 4)
 BGP_COUNT = 2
+# Display names as shown in Azure portal > Quotas (used if the API doesn't return them)
+FAMILY_LABELS = {
+    "standardDv5Family": "Standard Dv5 Family vCPUs",
+    "standardDv4Family": "Standard Dv4 Family vCPUs",
+    "standardDSv5Family": "Standard DSv5 Family vCPUs",
+    "standardDv2Family": "Standard Dv2 Family vCPUs",
+}
 
 # Outbound endpoints. "roles" = subnets the doc lists as source.
 #   mgmt = cluster management subnet (tested from the PC subnet, see README)
@@ -265,6 +288,20 @@ def add(status, check, detail="", fix=""):
     print(line)
     if fix and status in ("FAIL", "WARN"):
         print(col("DIM", f"         -> {fix}"))
+
+
+def print_banner():
+    w = 78
+    bar = "=" * w
+    print(col("B", bar))
+    print(col("B", "  NUTANIX CLOUD CLUSTERS (NC2)  x  MICROSOFT AZURE".center(w).rstrip()))
+    print(col("B", f"  Landing zone pre-check  v{VERSION}".center(w).rstrip()))
+    print(col("B", bar))
+    for line in DISCLAIMER_LINES:
+        print(col("WARN", f"  ! {line}"))
+    print(col("DIM", f"  Requirements source: Nutanix 'Requirements for NC2 on Azure' (updated {DOC_DATE})"))
+    print(col("DIM", f"  {REPO_URL}"))
+    print(col("B", bar))
 
 
 def note(text):
@@ -568,6 +605,12 @@ def check_skus(ctx):
             "NC2 cannot deploy a Flow Gateway in this region/subscription until a size is unblocked.")
     if ctx["routing"] == "bgp" and not ctx["sku_ok"].get(BGP_PRIMARY[0]) and not ctx["sku_ok"].get(BGP_FALLBACK[0]):
         add("FAIL", "BGP gateway VM size usable", f"neither {BGP_PRIMARY[0]} nor {BGP_FALLBACK[0]} is available")
+    # The size that was NOT selected, for information
+    other = "small" if size == "large" else "large"
+    osku = FGW_SKUS[other]["v5"][0]
+    st, why = status_of(osku)
+    ctx["sku_ok"][osku] = st in ("ok", "partial")
+    add("INFO", f"{osku} (Flow Gateway, alternative {other} size)", why)
 
 
 def check_quotas(ctx):
@@ -591,10 +634,15 @@ def check_quotas(ctx):
         cur, lim, _ = u.get(family.lower(), (0, 0, family))
         return lim - cur, cur, lim
 
+    def fam_name(family):
+        name = u.get(family.lower(), (0, 0, None))[2]
+        return name if name and name.lower() != family.lower() else FAMILY_LABELS.get(family, family)
+
     n, size = ctx["fgw_count"], ctx["fgw_size"]
     total_vcpu_needed, vm_needed = 0, n
+    size_lbl = {"small": "Small", "large": "Large"}
 
-    # Flow Gateway family quota
+    # Flow Gateway family quota (selected size)
     res = {}
     for gen in ("v5", "v4"):
         sku, fam, vcpu = FGW_SKUS[size][gen]
@@ -604,21 +652,34 @@ def check_quotas(ctx):
     ok5, ok4 = res["v5"][0] and ctx["sku_ok"].get(res["v5"][1], True), res["v4"][0] and ctx["sku_ok"].get(res["v4"][1], True)
     for gen in ("v5", "v4"):
         ok, sku, fam, need, f, cur, lim = res[gen]
-        txt = f"{n} x {sku} needs {need} vCPU; {fam}: {cur}/{lim} used, {f} free"
+        txt = f"{n} x {sku} = {need} vCPU needed; '{fam_name(fam)}': {cur}/{lim} used, {f} free"
         if gen == "v5":
-            add("PASS" if ok else ("WARN" if ok4 else "FAIL"), "Flow Gateway quota (recommended v5)", txt,
-                "" if ok else f"Request a quota increase for '{u.get(fam.lower(), (0, 0, fam))[2]}' in "
+            add("PASS" if ok else ("WARN" if ok4 else "FAIL"),
+                f"Flow Gateway quota - {size_lbl[size]}, v5 (recommended)", txt,
+                "" if ok else f"Request a quota increase for '{fam_name(fam)}' in "
                               f"{ctx['location_display']} to at least {cur + need} vCPUs.")
         else:
-            add("PASS" if ok else ("INFO" if ok5 else "FAIL"), "Flow Gateway quota (supported v4)", txt,
-                "" if ok else f"Request a quota increase for '{u.get(fam.lower(), (0, 0, fam))[2]}' to at least {cur + need}.")
+            add("PASS" if ok else ("INFO" if ok5 else "FAIL"),
+                f"Flow Gateway quota - {size_lbl[size]}, v4 (legacy)", txt,
+                "" if ok else f"Request a quota increase for '{fam_name(fam)}' to at least {cur + need} vCPUs.")
     fgw_vcpu = n * FGW_SKUS[size]["v5"][2]
     total_vcpu_needed += fgw_vcpu
+
+    # The other FGW size, so the customer sees both options
+    other = "small" if size == "large" else "large"
+    osku, ofam, ovcpu = FGW_SKUS[other]["v5"]
+    oneed = n * ovcpu
+    f, cur, lim = free(ofam)
+    add("INFO", f"Flow Gateway quota - {size_lbl[other]}, v5 (not selected)",
+        f"{n} x {osku} = {oneed} vCPU needed; '{fam_name(ofam)}': {f} free -> "
+        + ("enough" if f >= oneed else f"NOT enough (raise to at least {cur + oneed})"))
+
+    # Scale-out headroom (up to 4 FGW VMs)
     if n < 4:
         max_need = 4 * FGW_SKUS[size]["v5"][2]
         f, cur, lim = free(FGW_SKUS[size]["v5"][1])
-        add("PASS" if f >= max_need else "INFO", "Headroom for 4-node FGW scale-out (64 Gbps max)",
-            f"needs {max_need} vCPU in {FGW_SKUS[size]['v5'][1]}, {f} free")
+        add("PASS" if f >= max_need else "INFO", "Headroom for 4 x FGW scale-out (64 Gbps max)",
+            f"4 x {FGW_SKUS[size]['v5'][0]} = {max_need} vCPU; '{fam_name(FGW_SKUS[size]['v5'][1])}': {f} free")
 
     # BGP VMs (Route Server routing only)
     if ctx["routing"] == "bgp":
@@ -630,19 +691,24 @@ def check_quotas(ctx):
         ff, fcur, flim = free(ffam)
         prim_ok = f >= need and ctx["sku_ok"].get(sku, True)
         fb_ok = ff >= fneed and ctx["sku_ok"].get(fsku, True)
+        prim_txt = f"2 x {sku} = {need} vCPU needed; '{fam_name(fam)}': {cur}/{lim} used, {f} free"
+        fb_txt = f"2 x {fsku} = {fneed} vCPU needed; '{fam_name(ffam)}': {fcur}/{flim} used, {ff} free"
         if prim_ok:
-            add("PASS", "BGP gateway VM quota", f"2 x {sku} needs {need} vCPU; {fam}: {cur}/{lim} used, {f} free")
+            add("PASS", "BGP gateway quota - primary", prim_txt)
+            add("INFO", "BGP gateway quota - fallback", fb_txt + (" -> enough" if fb_ok else " -> not needed"))
             total_vcpu_needed += need
         elif fb_ok:
-            add("WARN", "BGP gateway VM quota",
-                f"{fam} has {f} free (needs {need}); NC2 will fall back to 2 x {fsku} ({ffam}: {ff} free)",
-                f"Raise '{fam}' to at least {cur + need} to get the preferred {sku}.")
+            add("WARN", "BGP gateway quota - primary", prim_txt,
+                f"Raise '{fam_name(fam)}' to at least {cur + need} vCPUs to get the preferred {sku} "
+                f"(note: Dv5 quota does not count for {sku}).")
+            add("PASS", "BGP gateway quota - fallback", fb_txt + f" -> NC2 will deploy {fsku}")
             total_vcpu_needed += fneed
         else:
-            add("FAIL", "BGP gateway VM quota",
-                f"{fam}: {f} free (needs {need}); fallback {ffam}: {ff} free (needs {fneed})",
-                f"Request '{fam}' >= {cur + need} vCPUs in {ctx['location_display']} "
+            add("FAIL", "BGP gateway quota - primary", prim_txt,
+                f"Request '{fam_name(fam)}' >= {cur + need} vCPUs in {ctx['location_display']} "
                 f"(or switch Flow Gateway routing to ILB, which needs no BGP VMs).")
+            add("FAIL", "BGP gateway quota - fallback", fb_txt,
+                f"Alternatively request '{fam_name(ffam)}' >= {fcur + fneed} vCPUs.")
             total_vcpu_needed += need
         vm_needed += BGP_COUNT
     else:
@@ -1451,6 +1517,9 @@ def connectivity_test(ctx, L):
     except AzError as e:
         add("WARN", "Connectivity test skipped", f"could not create resource group: {e}")
         return
+    ctx["changes"] = (f"Temporary resource group '{rg}' with test VMs was created for the connectivity test and "
+                      + ("KEPT (--keep-test-vms) - delete it when done." if ctx.get("keep_vms")
+                         else "deleted again at the end of the run."))
     try:
         jobs = {}
         with cf.ThreadPoolExecutor(len(plan)) as ex:
@@ -1549,6 +1618,8 @@ def write_reports(ctx, L, outdir):
         "subscription": f"{ctx['sub']['name']} ({ctx['sub']['id']})", "region": ctx["location_display"],
         "flow_gateway": f"{ctx['fgw_count']} x {ctx['fgw_size']}", "routing": ctx["routing"],
         "on_prem": ctx["onprem"],
+        "changes_made_in_azure": ctx.get("changes") or "None - read-only run.",
+        "disclaimer": DISCLAIMER_LINES,
         "subnets": {ROLE_INFO[k][0]: (L.label(v) if v else "-") for k, v in ctx["subnets"].items()},
     }
     with open(base + ".json", "w") as f:
@@ -1589,10 +1660,30 @@ tr.sec td{{background:#f5f5f7;font-weight:600;padding-top:10px}}
 .b{{display:inline-block;border-radius:4px;padding:1px 6px;font-size:11px;font-weight:700;color:#fff}}
 .b.PASS{{background:#12a150}} .b.FAIL{{background:#d92d20}} .b.WARN{{background:#dc8b00}} .b.INFO{{background:#5b7083}}
 td:nth-child(4){{color:#555}} a{{color:#2563eb}}
+.hero{{background:linear-gradient(120deg,#131a2e 0%,#1f2a4a 60%,#26365f 100%);color:#fff;border-radius:12px;padding:22px 26px;margin-bottom:16px}}
+.brands{{display:flex;align-items:center;gap:16px;margin-bottom:14px;flex-wrap:wrap}}
+.brands img{{height:34px}}
+.chip{{display:none;align-items:center;height:34px;padding:0 14px;border:1px solid rgba(255,255,255,.35);border-radius:8px;font-weight:600;font-size:14px;letter-spacing:.3px}}
+.x{{opacity:.6;font-size:18px}}
+.hero h1{{color:#fff;font-size:24px}} .hero .sub{{color:#c9d2e8;margin:6px 0 0}} .hero .sub a{{color:#9ec5ff}}
+.disc{{border:1px solid #f0c36d;background:#fff8e6;color:#5c4400;border-radius:8px;padding:10px 14px;font-size:13px;margin:0 0 16px}}
+.disc ul{{margin:4px 0 0 18px;padding:0}} .changes{{font-size:13px;color:#333;margin:0 0 16px}}
+footer{{margin-top:28px;padding-top:12px;border-top:1px solid #eee;color:#777;font-size:12px}}
 </style></head><body>
-<h1>NC2 on Azure - landing zone pre-check</h1>
-<div class="sub">Generated {e(meta['generated'])} &middot; tool v{VERSION} &middot; based on
-<a href="{e(DOC_URL)}">Requirements for NC2 on Azure</a> (last updated {DOC_DATE})</div>
+<div class="hero">
+ <div class="brands">
+  <img src="{e(LOGO_NC2_URL)}" alt="Nutanix NC2" onerror="this.style.display='none';this.nextElementSibling.style.display='inline-flex'">
+  <span class="chip">Nutanix Cloud Clusters (NC2)</span>
+  <span class="x">&times;</span>
+  <img src="{e(LOGO_AZURE_URL)}" alt="Microsoft Azure" onerror="this.style.display='none';this.nextElementSibling.style.display='inline-flex'">
+  <span class="chip">Microsoft Azure</span>
+ </div>
+ <h1>NC2 on Azure - landing zone pre-check</h1>
+ <div class="sub">Generated {e(meta['generated'])} &middot; tool v{VERSION} &middot; based on
+ <a href="{e(DOC_URL)}">Requirements for NC2 on Azure</a> (last updated {DOC_DATE})</div>
+</div>
+<div class="disc"><b>Disclaimer</b><ul>{''.join(f'<li>{e(x)}</li>' for x in DISCLAIMER_LINES)}</ul></div>
+<div class="changes"><b>Changes made in Azure during this run:</b> {e(meta['changes_made_in_azure'])}</div>
 <div class="verdict {vclass}">{verdict}</div>
 <div class="cards">
 <div class="card"><b style="color:#d92d20">{counts['FAIL']}</b>Fail</div>
@@ -1610,7 +1701,11 @@ td:nth-child(4){{color:#555}} a{{color:#2563eb}}
 <h2 style="font-size:16px;margin:20px 0 8px">All checks</h2>
 <table><tr><th style="width:60px">Status</th><th style="width:28%">Check</th><th>Detail</th><th style="width:28%">How to fix</th></tr>
 {''.join(rows)}
-</table></body></html>"""
+</table>
+<footer>Community tool, not an official Nutanix product and not supported by Nutanix Support. Provided as-is,
+without warranty. Always verify against the official Nutanix documentation. Product names and logos are
+trademarks of their respective owners. &middot; <a href="{e(REPO_URL)}">{e(REPO_URL)}</a></footer>
+</body></html>"""
     with open(base + ".html", "w") as f:
         f.write(doc)
     return base, counts
@@ -1710,8 +1805,7 @@ def main():
     args = ap.parse_args()
     INTERACTIVE = not args.yes and sys.stdin.isatty()
 
-    print(col("B", f"NC2 on Azure - landing zone pre-check v{VERSION}"))
-    print(col("DIM", f"Requirements source: Nutanix 'Requirements for NC2 on Azure' (updated {DOC_DATE})"))
+    print_banner()
 
     try:
         if args.subscription:
@@ -1763,7 +1857,7 @@ def main():
                                                 "Internal Load Balancer (ILB) - no BGP VMs / Route Server"], 0)]
     ctx["fgw_size"] = args.fgw_size or ["small", "large"][choose(col("B", "\nFlow Gateway size?"),
                                                                  ["Small - D4_v5/D4_v4, 4 vCPU (~10 Gbps each)",
-                                                                  "Large - D32_v5/D32_v4, 32 vCPU (~16 Gbps each)"], 0)]
+                                                                  "Large - D32_v5/D32_v4, 32 vCPU (~16 Gbps each)"], 1)]
     if args.fgw_count:
         ctx["fgw_count"] = args.fgw_count
     else:
@@ -1784,11 +1878,13 @@ def main():
         if args.connectivity:
             run_conn = True
         elif INTERACTIVE:
-            print(col("B", "\nIn-VNet connectivity test"))
-            print("  Creates a temporary resource group with 1 small Ubuntu VM (no public IP) per tested subnet,")
-            print("  tests DNS, NTP, HTTPS endpoints and ports from INSIDE your VNets, then deletes everything.")
-            print("  Takes ~5 minutes and costs a few cents.")
-            run_conn = yesno("  Run it?", True)
+            print(col("B", "\nOptional: in-VNet connectivity test (recommended)"))
+            print("  Tests DNS, NTP, HTTPS endpoints and ports from INSIDE your VNets.")
+            print(col("WARN", "  This is the only step that changes anything in Azure:"))
+            print("  it creates a temporary resource group with 1 small Ubuntu VM (no public IP) per tested")
+            print("  subnet and deletes it again at the end. Takes ~5 minutes and costs a few cents.")
+            print("  Answer 'n' (default) to keep this run completely read-only.")
+            run_conn = yesno("  Run the connectivity test?", False)
 
     checks = [check_subscription, check_providers, check_skus, check_quotas, check_policies, check_identity]
     for fn in checks:
@@ -1822,6 +1918,7 @@ def main():
         print(col("WARN", "  Ready with warnings: review the WARN items."))
     else:
         print(col("PASS", "  Landing zone looks ready for NC2."))
+    print(f"\n  Changes made in Azure: {ctx.get('changes') or 'none - read-only run.'}")
     print(f"\n  Report: {base}.html")
     print(f"          {base}.json")
     print(col("DIM", "  Cloud Shell: Manage files > Download, then enter the path above "
